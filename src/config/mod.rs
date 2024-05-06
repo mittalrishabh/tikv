@@ -3431,7 +3431,7 @@ pub struct TikvConfig {
     #[online_config(skip)]
     pub raft_engine: RaftEngineConfig,
 
-    #[online_config(skip)]
+    #[online_config(submodule)]
     pub security: SecurityConfig,
 
     #[online_config(submodule)]
@@ -5051,6 +5051,8 @@ mod tests {
         incoming.gc.max_write_bytes_per_sec = ReadableSize::mb(100);
         incoming.rocksdb.defaultcf.block_cache_size = Some(ReadableSize::mb(500));
         incoming.storage.io_rate_limit.import_priority = file_system::IoPriority::High;
+        incoming.security.redact_info_log = Some(true);
+
         let diff = old.diff(&incoming);
         let mut change = HashMap::new();
         change.insert(
@@ -5066,6 +5068,7 @@ mod tests {
             "storage.io-rate-limit.import-priority".to_owned(),
             "high".to_owned(),
         );
+        change.insert("security.redact_info_log".to_owned(), "true".to_owned());
         let res = to_config_change(change).unwrap();
         assert_eq!(diff, res);
 
