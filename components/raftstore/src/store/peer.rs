@@ -897,6 +897,7 @@ where
     pub snapshot_recovery_state: Option<SnapshotBrState>,
 
     last_record_safe_point: u64,
+    read_index_resp: HashMap<u64, u64>,
 }
 
 impl<EK, ER> Peer<EK, ER>
@@ -1041,6 +1042,7 @@ where
             lead_transferee: raft::INVALID_ID,
             unsafe_recovery_state: None,
             snapshot_recovery_state: None,
+            read_index_resp: HashMap::default(),
         };
 
         // If this region has only one peer and I am the one, campaign directly.
@@ -1815,6 +1817,13 @@ where
             // in raft-rs which may be greater than the former one.
             // For more details, see the annotations above `on_leader_commit_idx_changed`.
             let index = self.get_store().commit_index();
+
+            let mut start_ts: u64 = 0;
+            let mut rctx = ReadIndexContext::parse(m.get_entries()[0].get_data()).unwrap();
+            if let Some(request) = rctx.request.take() {
+                start_ts = request.get_start_ts();
+            }
+
             // Check if the log term of this index is equal to current term, if so,
             // this index can be used to reply the read index request if the leader holds
             // the lease. Please also take a look at raft-rs.
@@ -1823,6 +1832,15 @@ where
                 if let LeaseState::Valid = state {
                     // If current peer has valid lease, then we could handle the
                     // request directly, rather than send a heartbeat to check quorum.
+
+                    let val = self.read_index_resp.get(&m.from);
+                    if val.is_some() && *val.unwrap() == start_ts {
+                        // this message can be dedupd with the last one
+                        ctx.raft_metrics.read_index_dedup.inc();
+                    } else if self.next_proposal_index() - self.get_store().applied_index() == 1 {
+                        // there are no pending proposals
+                        self.read_index_resp.insert(m.from, start_ts);
+                    }
                     let mut resp = eraftpb::Message::default();
                     resp.set_msg_type(MessageType::MsgReadIndexResp);
                     resp.term = self.term();
@@ -3330,6 +3348,7 @@ where
     /// Responses to the ready read index request on the replica, the replica is
     /// not a leader.
     fn post_pending_read_index_on_replica<T>(&mut self, ctx: &mut PollContext<EK, ER, T>) {
+        let mut retry_reqs = 0;
         while let Some(mut read) = self.pending_reads.pop_front() {
             // The response of this read index request is lost, but we need it for
             // the memory lock checking result. Resend the request.
@@ -3346,6 +3365,7 @@ where
                 );
                 RAFT_READ_INDEX_PENDING_COUNT.sub(1);
                 self.send_read_command(ctx, read_cmd);
+                retry_reqs += 1;
                 continue;
             }
 
@@ -3373,6 +3393,12 @@ where
                 self.pending_reads.push_front(read);
                 break;
             }
+        }
+        if retry_reqs != 0 {
+            ctx.raft_metrics.read_index_retry.inc_by(retry_reqs);
+            ctx.raft_metrics
+                .read_index_retry_dedup
+                .inc_by(retry_reqs - 1);
         }
     }
 
