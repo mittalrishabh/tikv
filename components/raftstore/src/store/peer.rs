@@ -1824,7 +1824,6 @@ where
             // For more details, see the annotations above `on_leader_commit_idx_changed`.
             let index = self.get_store().commit_index();
 
-
             // Check if the log term of this index is equal to current term, if so,
             // this index can be used to reply the read index request if the leader holds
             // the lease. Please also take a look at raft-rs.
@@ -1835,7 +1834,7 @@ where
                     // request directly, rather than send a heartbeat to check quorum.
 
                     let val = self.read_index_resp.get(&m.from);
-                    if val.is_some() && *val.unwrap() == start_ts  && start_ts != 0 {
+                    if val.is_some() && *val.unwrap() == start_ts && start_ts != 0 {
                         // this message can be dedupd with the last one
                         ctx.raft_metrics.read_index_dedup.inc();
                     } else if self.next_proposal_index() - self.get_store().applied_index() == 1 {
