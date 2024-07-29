@@ -417,9 +417,8 @@ where
                             .set(*region_id, resolver, &core, &leader_info);
                     }
                 } else {
-                    RTS_MIN_FOLLOWER_SAFE_TS_GAP_HISTOGRAM.observe(now.saturating_sub(
-                        TimeStamp::from(stats.min_follower_safe_ts.safe_ts).physical(),
-                    ) as f64);
+                    RTS_MIN_FOLLOWER_SAFE_TS_GAP_HISTOGRAM
+                        .observe(now.saturating_sub(TimeStamp::from(safe_ts).physical()) as f64);
 
                     // follower safe-ts
                     if safe_ts > 0 && safe_ts < stats.min_follower_safe_ts.safe_ts {
