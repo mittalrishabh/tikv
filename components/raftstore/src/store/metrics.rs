@@ -688,6 +688,11 @@ lazy_static! {
         "Total number of read index messages deduped."
     ).unwrap();
 
+    pub static ref READ_INDEX_NO_WRITES_COUNTER: IntCounter = register_int_counter!(
+        "tikv_read_index_no_writes",
+        "Total number of read index messages where no writes were found since last read index message"
+    ).unwrap();
+
     pub static ref READ_INDEX_RETRY_COUNTER: IntCounter = register_int_counter!(
         "tikv_read_index_retry",
         "Total number of read index messages retried."

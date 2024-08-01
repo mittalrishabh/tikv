@@ -156,6 +156,7 @@ pub struct RaftMetrics {
     pub invalid_proposal: RaftInvalidProposalCounterVec,
     pub raft_log_gc_skipped: RaftLogGcSkippedCounterVec,
     pub read_index_dedup: LocalIntCounter,
+    pub read_index_no_writes: LocalIntCounter,
     pub read_index_retry: LocalIntCounter,
     pub read_index_retry_dedup: LocalIntCounter,
 
@@ -196,6 +197,7 @@ impl RaftMetrics {
             ready: RaftReadyCounterVec::from(&STORE_RAFT_READY_COUNTER_VEC),
             send_message: RaftSendMessageMetrics::default(),
             read_index_dedup: READ_INDEX_DEDUP_COUNTER.local(),
+            read_index_no_writes: READ_INDEX_NO_WRITES_COUNTER.local(),
             read_index_retry: READ_INDEX_RETRY_COUNTER.local(),
             read_index_retry_dedup: READ_INDEX_RETRY_DEDUP_COUNTER.local(),
             message_dropped: RaftDroppedMessageCounterVec::from(
@@ -242,6 +244,7 @@ impl RaftMetrics {
         self.ready.flush();
         self.send_message.flush();
         self.read_index_dedup.flush();
+        self.read_index_no_writes.flush();
         self.read_index_retry_dedup.flush();
         self.read_index_retry.flush();
         self.message_dropped.flush();

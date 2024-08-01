@@ -214,6 +214,18 @@ lazy_static! {
         "Total number of stale read requests directly executed by local reader."
     )
     .unwrap();
+    pub static ref SAFE_TIME_STALE_READ_DIFF_HISTOGRAM: Histogram = register_histogram!(
+        "tikv_raftstore_local_read_stale_read_safe_ts",
+        "Bucketed histogram of the difference between the safe time and time of the stale read request.",
+        exponential_buckets(10.0, 2.0, 20).unwrap()
+    )
+    .unwrap();
+    pub static ref SAFE_TIME_STALE_READ_LAG_HISTOGRAM: Histogram = register_histogram!(
+        "tikv_raftstore_local_read_stale_read_lag",
+        "Bucketed histogram of the difference between the safe time and the start time of the stale read request if safe time is lagging.",
+        exponential_buckets(10.0, 2.0, 20).unwrap()
+    )
+    .unwrap();
     pub static ref RAFT_LOG_GC_WRITE_DURATION_HISTOGRAM: Histogram = register_histogram!(
         "tikv_raftstore_raft_log_gc_write_duration_secs",
         "Bucketed histogram of write duration of raft log gc.",

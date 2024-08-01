@@ -573,6 +573,9 @@ impl ReadDelegate {
         let safe_ts = self.read_progress.safe_ts();
         fail_point!("skip_check_stale_read_safe", |_| Ok(()));
         if safe_ts >= read_ts {
+            SAFE_TIME_STALE_READ_DIFF_HISTOGRAM.observe(
+                (TimeStamp::from(safe_ts).physical() - TimeStamp::from(read_ts).physical()) as f64,
+            );
             return Ok(());
         }
         // Advancing resolved ts may be expensive, only notify if read_ts - safe_ts >
@@ -580,6 +583,9 @@ impl ReadDelegate {
         if TimeStamp::from(read_ts).physical() > TimeStamp::from(safe_ts).physical() + 200 {
             self.read_progress.notify_advance_resolved_ts();
         }
+        SAFE_TIME_STALE_READ_LAG_HISTOGRAM.observe(
+            (TimeStamp::from(read_ts).physical() - TimeStamp::from(safe_ts).physical()) as f64,
+        );
         debug!(
             "reject stale read by safe ts";
             "safe_ts" => safe_ts,

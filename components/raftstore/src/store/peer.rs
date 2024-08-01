@@ -897,7 +897,7 @@ where
     pub snapshot_recovery_state: Option<SnapshotBrState>,
 
     last_record_safe_point: u64,
-    read_index_resp: HashMap<u64, u64>,
+    read_index_resp: HashMap<u64, (u64, u64)>,
 }
 
 impl<EK, ER> Peer<EK, ER>
@@ -1832,14 +1832,26 @@ where
                 if let LeaseState::Valid = state {
                     // If current peer has valid lease, then we could handle the
                     // request directly, rather than send a heartbeat to check quorum.
-
-                    let val = self.read_index_resp.get(&m.from);
-                    if val.is_some() && *val.unwrap() == start_ts && start_ts != 0 {
-                        // this message can be dedupd with the last one
-                        ctx.raft_metrics.read_index_dedup.inc();
-                    } else if self.next_proposal_index() - self.get_store().applied_index() == 1 {
+                    let current_proposal_index = self.next_proposal_index() - 1;
+                    let current_applied_index = self.get_store().applied_index();
+                    if let Some(&(ts, applied_index)) = self.read_index_resp.get(&m.from) {
+                        if start_ts != 0 && ts >= start_ts {
+                            // this message can be dedupd with the last one
+                            ctx.raft_metrics.read_index_dedup.inc();
+                        } else if ts < start_ts && current_proposal_index == current_applied_index {
+                            // there are no pending proposals
+                            self.read_index_resp
+                                .insert(m.from, (start_ts, self.get_store().applied_index()));
+                        }
+                        if current_proposal_index == current_applied_index
+                            && current_applied_index == applied_index
+                        {
+                            ctx.raft_metrics.read_index_no_writes.inc();
+                        }
+                    } else if current_proposal_index == current_applied_index {
                         // there are no pending proposals
-                        self.read_index_resp.insert(m.from, start_ts);
+                        self.read_index_resp
+                            .insert(m.from, (start_ts, self.get_store().applied_index()));
                     }
                     let mut resp = eraftpb::Message::default();
                     resp.set_msg_type(MessageType::MsgReadIndexResp);
