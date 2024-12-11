@@ -1,0 +1,7 @@
+---
+dockerfile: ../Dockerfile
+steps:
+  - type: run
+    label: unit tests
+    command: |
+      cargo test

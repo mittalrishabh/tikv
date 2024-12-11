@@ -1,0 +1,7 @@
+---
+dockerfile: ../Dockerfile
+steps:
+  - type: run
+    label: build tikv
+    command: |
+      make build

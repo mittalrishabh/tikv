@@ -1,0 +1,82 @@
+dockerfile: ../Dockerfile-publish
+
+steps:
+  - type: run
+    label: setup git access
+    command: |
+      set -ex +u
+      echo PWD is $PWD
+      cat << EOF > /tmp/commitment_key
+      {% secret key=commitment_key %}
+      EOF
+      echo 'ssh -i /tmp/commitment_key -o StrictHostKeyChecking=no $1 $2' > /tmp/commitment_wrapper
+      chmod 600 /tmp/commitment_key
+      chmod 755 /tmp/commitment_wrapper
+      cd /tmp
+      env GIT_SSH=/tmp/commitment_wrapper git clone git@commitment.musta.ch:airbnb/sitar-agent
+
+  - type: run
+    label: setup rust-rocksdb
+    command: |
+      set -ex +u
+      tag=$RUST_ROCKSDB_TAG
+      # If set, uses airbnb/tidb-rust-rocksdb, otherwise by default uses pingcap's tikv/rust-rocksdb.
+      if [[ ! -z "$tag" ]]; then
+          cd tikv
+          # Clone rust-rocksdb but don't yet clone rocksdb submodule
+          sudo env GIT_SSH=/tmp/commitment_wrapper git clone git@commitment.musta.ch:airbnb/tidb-rust-rocksdb.git rust-rocksdb
+
+          cd rust-rocksdb
+          git checkout tags/$tag -b $tag
+
+          # Detect if we are using a forked version of rocksdb to build as well
+          # If so, override the rocksdb submodule path to use commitment
+          # Then we can properly initialize the submodules
+          if grep -q "git@git.musta.ch" .gitmodules; then
+            echo "Found custom rocksdb override."
+            git submodule set-url rocksdb git@commitment.musta.ch:airbnb/tidb-rocksdb.git
+            git submodule sync --recursive
+            sudo env GIT_SSH=/tmp/commitment_wrapper git submodule update --init --recursive
+          else
+            git submodule update --init --recursive
+          fi
+      fi
+
+  - type: run
+    label: build tikv
+    command: |
+      set -ex +u
+      docker --version
+      aws --version
+
+      docker build -t tidb/tikv -f _infra/ci/Dockerfile-artifacts .
+
+  - type: run
+    label: publish images
+    command: |
+      set -ex +u
+      docker --version
+      aws --version
+
+      REPO=172631448019.dkr.ecr.us-east-1.amazonaws.com
+
+      # Version information is printed by the Dockerfile build itself
+      aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin $REPO
+
+      # For each image push a tag with the semantic version and short sha, e.g. v6.5.4-beb0a6b
+      images=("tikv")
+      SHORT_SHA=${JORB_GIT_SHA:0:7}
+      SEM_VER=$(git describe --tags --dirty --always | cut -d '-' -f 1)
+      tags=("${SEM_VER}-${SHORT_SHA}")
+      for image in "${images[@]}"; do
+        for tag in "${tags[@]}"; do
+          # check if the image already exists and push it if not
+          qualified_image=$REPO/tidb/${image}:${tag}
+          if docker manifest inspect $qualified_image &> /dev/null; then
+            echo "Image $qualified_image already exists in remote. Skipping push"
+          else
+            docker tag tidb/${image}:latest $qualified_image
+            docker push $qualified_image
+          fi
+        done
+      done

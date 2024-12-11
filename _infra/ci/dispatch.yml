@@ -1,0 +1,42 @@
+---
+templates:
+  condition1: &run_tests "not(contains('skip-test', env('JORB_GIT_BRANCH')))"
+  condition2: &publish_and_test "not(contains('skip-test', env('JORB_GIT_BRANCH'))) && (left(env('JORB_GIT_BRANCH'), 8) == 'release-' || right(env('JORB_GIT_BRANCH'), 3) == '-ci' || left(env('JORB_GIT_BRANCH'), 6) == 'master')"
+  condition3: &publish_no_test "contains('skip-test', env('JORB_GIT_BRANCH')) && (left(env('JORB_GIT_BRANCH'), 8) == 'release-' || right(env('JORB_GIT_BRANCH'), 3) == '-ci')"
+
+jobs:
+- name: Build
+  path: _infra/ci/jobs/build.yml
+  options:
+    id: tikv/build
+    only_run_if: *run_tests
+    large: true
+    github_check:
+      enabled: true
+- name: Unit Tests
+  path: _infra/ci/jobs/unit.yml
+  options:
+    id: tikv/unit-tests
+    only_run_if: *run_tests
+    large: true
+    depends_on:
+    - id: tikv/build
+    github_check:
+      enabled: true
+    timeout_in_minutes: 30
+- name: Build And Publish Images
+  path: _infra/ci/jobs/publish.yml
+  options:
+    memory_in_gb: 32
+    env:
+      ARTIFACTS_TAG: tool-additions-v1.8
+    github_check:
+      enabled: true
+    timeout_in_minutes: 60
+  variants:
+  - only_run_if: *publish_and_test
+    id: tikv/publish-image
+    depends_on:
+    - id: tikv/unit-tests
+  - only_run_if: *publish_no_test
+    id: tikv/publish-image-without-tests

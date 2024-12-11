@@ -1,0 +1,8 @@
+---
+dockerfile: ../Dockerfile
+steps:
+  - type: run
+    label: lint
+    command: |
+      cargo fmt --check
+      make clippy
