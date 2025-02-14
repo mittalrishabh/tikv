@@ -1918,8 +1918,12 @@ where
         }
         let msg_type = m.get_msg_type();
         if msg_type == MessageType::MsgReadIndex {
-            ctx.coprocessor_host
-                .on_step_read_index(&mut m, self.get_role(), Some(self.region().get_start_key(), Some(self.region().get_end_key());
+            ctx.coprocessor_host.on_step_read_index(
+                &mut m,
+                self.get_role(),
+                Some(self.region().get_start_key()),
+                Some(self.region().get_end_key()),
+            );
             // Must use the commit index of `PeerStorage` instead of the commit index
             // in raft-rs which may be greater than the former one.
             // For more details, see the annotations above `on_leader_commit_idx_changed`.
