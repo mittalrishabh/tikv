@@ -1041,6 +1041,17 @@ impl ResourceGroupManager {
         self.noisy_groups.read().clone()
     }
 
+    /// The blamed groups, for reporting to clients. An empty result means
+    /// nothing is blamed; callers that put this on the wire must keep that
+    /// distinct from not reporting at all, since a client can only clear what
+    /// it knows on the strength of a positive "nobody" answer.
+    pub fn noisy_group_names(&self) -> Vec<String> {
+        if !self.has_noisy_groups.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
+        self.noisy_groups.read().iter().cloned().collect()
+    }
+
     /// The only writer, so `has_noisy_groups` cannot drift from the set.
     fn set_noisy_groups(&self, groups: HashSet<String>) {
         let empty = groups.is_empty();
@@ -1998,6 +2009,22 @@ pub(crate) mod tests {
             group.set_raw_resource_settings(resource_setting);
         }
         group
+    }
+
+    #[test]
+    fn test_noisy_group_names_mirrors_the_set() {
+        let mgr = ResourceGroupManager::default();
+        assert!(mgr.noisy_group_names().is_empty());
+
+        mgr.set_noisy_groups(HashSet::from(["tenant1".to_owned(), "tenant2".to_owned()]));
+        let mut names = mgr.noisy_group_names();
+        names.sort();
+        assert_eq!(names, vec!["tenant1".to_owned(), "tenant2".to_owned()]);
+
+        // Clearing has to be visible, since this is what tells a client to stop
+        // pinning the group.
+        mgr.clear_noisy_groups();
+        assert!(mgr.noisy_group_names().is_empty());
     }
 
     #[test]

@@ -1098,6 +1098,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
             self.health_controller.clone(),
             self.health_feedback_seq.clone(),
             self.health_feedback_interval,
+            self.resource_manager.clone(),
         );
         let request_handler = stream.try_for_each(move |mut req| {
             let request_ids = req.take_request_ids();
@@ -1329,6 +1330,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
             self.health_controller.clone(),
             self.health_feedback_seq.clone(),
             self.health_feedback_interval,
+            self.resource_manager.clone(),
         );
 
         let mut resp = GetHealthFeedbackResponse::default();
@@ -2785,6 +2787,7 @@ struct HealthFeedbackAttacher {
     last_feedback_time: Option<Instant>,
     seq: Arc<AtomicU64>,
     feedback_interval: Option<Duration>,
+    resource_manager: Option<Arc<ResourceGroupManager>>,
 }
 
 impl HealthFeedbackAttacher {
@@ -2793,6 +2796,7 @@ impl HealthFeedbackAttacher {
         health_controller: HealthController,
         seq: Arc<AtomicU64>,
         feedback_interval: Option<Duration>,
+        resource_manager: Option<Arc<ResourceGroupManager>>,
     ) -> Self {
         Self {
             store_id,
@@ -2800,6 +2804,7 @@ impl HealthFeedbackAttacher {
             last_feedback_time: None,
             seq,
             feedback_interval,
+            resource_manager,
         }
     }
 
@@ -2858,6 +2863,15 @@ impl HealthFeedbackAttacher {
         feedback.set_feedback_seq_no(self.seq.fetch_add(1, Ordering::Relaxed));
         feedback.set_slow_score(self.health_controller.get_raftstore_slow_score() as i32);
         // TODO: set network slow score?
+        // Deliberately left unset without a resource manager rather than set
+        // empty: the client is allowed to clear what it knows about this store
+        // on an empty list, so "nobody is noisy" and "this store does not
+        // report noisy groups" must not look alike.
+        if let Some(resource_manager) = &self.resource_manager {
+            let mut noisy_groups = NoisyGroups::default();
+            noisy_groups.set_names(resource_manager.noisy_group_names().into());
+            feedback.set_noisy_groups(noisy_groups);
+        }
         feedback
     }
 }
@@ -2986,24 +3000,60 @@ mod tests {
     }
 
     #[test]
+    fn test_health_feedback_attacher_reports_noisy_groups() {
+        let health_controller = HealthController::new();
+        let seq = Arc::new(AtomicU64::new(1));
+        let resource_manager = Arc::new(ResourceGroupManager::default());
+
+        let mut a = HealthFeedbackAttacher::new(
+            1,
+            health_controller,
+            seq,
+            Some(Duration::from_secs(1)),
+            Some(resource_manager),
+        );
+        let mut resp = BatchCommandsResponse::default();
+        a.attach_if_needed(&mut resp);
+
+        // A store that reports noisy groups and currently blames nobody must
+        // say so positively, so that a client can clear what it knows. That is
+        // a present-but-empty message, not an absent one.
+        assert!(resp.get_health_feedback().has_noisy_groups());
+        assert!(
+            resp.get_health_feedback()
+                .get_noisy_groups()
+                .get_names()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn test_health_feedback_attacher() {
         let health_controller = HealthController::new();
         let test_reporter = health_controller::reporters::TestReporter::new(&health_controller);
         let seq = Arc::new(AtomicU64::new(1));
 
-        let mut a = HealthFeedbackAttacher::new(1, health_controller.clone(), seq.clone(), None);
+        let mut a =
+            HealthFeedbackAttacher::new(1, health_controller.clone(), seq.clone(), None, None);
         let mut resp = BatchCommandsResponse::default();
         a.attach_if_needed(&mut resp);
         assert!(!resp.has_health_feedback());
 
-        let mut a =
-            HealthFeedbackAttacher::new(1, health_controller, seq, Some(Duration::from_secs(1)));
+        let mut a = HealthFeedbackAttacher::new(
+            1,
+            health_controller,
+            seq,
+            Some(Duration::from_secs(1)),
+            None,
+        );
         resp = BatchCommandsResponse::default();
         a.attach_if_needed(&mut resp);
         assert!(resp.has_health_feedback());
         assert_eq!(resp.get_health_feedback().get_store_id(), 1);
         assert_eq!(resp.get_health_feedback().get_feedback_seq_no(), 1);
         assert_eq!(resp.get_health_feedback().get_slow_score(), 1);
+        // No resource manager, so the field stays absent rather than empty.
+        assert!(!resp.get_health_feedback().has_noisy_groups());
 
         // Skips attaching feedback because last attaching was just done.
         test_reporter.set_raftstore_slow_score(50.);
