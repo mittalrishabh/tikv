@@ -489,6 +489,18 @@ impl ReadPoolHandle {
         }
     }
 
+    /// Whether `resource_group` is itself being shed; the same predicate the
+    /// spawn path puts on `ReadPoolError`.
+    pub fn is_noisy_request(&self, resource_group: &str) -> bool {
+        match self {
+            ReadPoolHandle::Yatp {
+                resource_manager: Some(rm),
+                ..
+            } => rm.is_noisy_request(resource_group, false),
+            _ => false,
+        }
+    }
+
     /// Bytes, not `&str`: most requests never need the name, so skip UTF-8.
     pub fn check_busy_threshold(
         &self,

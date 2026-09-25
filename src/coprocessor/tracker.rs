@@ -648,6 +648,7 @@ mod tests {
             None,
             PerfLevel::EnableCount,
             false,
+            false,
         );
         let mut tracker: Tracker<RocksEngine> = Tracker::new(
             req_ctx_inner.into(),
@@ -688,6 +689,7 @@ mod tests {
                 TimeStamp::max(),
                 None,
                 PerfLevel::EnableCount,
+                false,
                 false,
             );
 

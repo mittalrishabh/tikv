@@ -36,7 +36,7 @@ use tidb_query_common::{
 use tikv_kv::{ExtraRegionOverride, SnapshotExt};
 use tikv_util::{
     DeferContext,
-    deadline::set_deadline_exceeded_busy_error,
+    deadline::{DEADLINE_EXCEEDED, set_deadline_exceeded_busy_error_with_reason},
     future::async_timeout,
     memory::{MemoryQuota, OwnedAllocated},
     quota_limiter::QuotaLimiter,
@@ -280,6 +280,14 @@ impl<E: Engine> Endpoint<E> {
         } else {
             None
         };
+        // Decided once, at admission. A deadline is mostly spent queueing, so
+        // when the queue is this group's own doing the client should back off
+        // rather than retry the same overloaded leader immediately.
+        let is_noisy_tenant = self.read_pool.is_noisy_request(
+            context
+                .get_resource_control_context()
+                .get_resource_group_name(),
+        );
 
         let mut input = CodedInputStream::from_bytes(&data);
         input.set_recursion_limit(self.recursion_limit);
@@ -321,6 +329,7 @@ impl<E: Engine> Endpoint<E> {
                     cache_match_version,
                     self.perf_level,
                     false,
+                    is_noisy_tenant,
                 );
                 with_tls_tracker(|tracker| {
                     tracker.req_info.request_type = RequestType::CoprocessorDag;
@@ -405,6 +414,7 @@ impl<E: Engine> Endpoint<E> {
                     cache_match_version,
                     self.perf_level,
                     false,
+                    is_noisy_tenant,
                 );
                 with_tls_tracker(|tracker| {
                     tracker.req_info.request_type = RequestType::CoprocessorAnalyze;
@@ -452,6 +462,7 @@ impl<E: Engine> Endpoint<E> {
                     // Checksum is allowed during the flashback period to make sure the tool such
                     // like BR can work.
                     true,
+                    is_noisy_tenant,
                 );
 
                 with_tls_tracker(|tracker| {
@@ -534,7 +545,7 @@ impl<E: Engine> Endpoint<E> {
         let snapshot_future = with_tls_engine(|engine| Self::async_in_memory_snapshot(engine, ctx));
         let max_duration_to_get_snapshot = ctx.deadline.remaining_duration();
         if max_duration_to_get_snapshot.is_zero() {
-            return Err(Error::DeadlineExceeded);
+            return Err(Error::DeadlineExceeded(ctx.is_noisy_tenant));
         }
         match async_timeout(snapshot_future, max_duration_to_get_snapshot).await {
             Ok(snapshot) => snapshot,
@@ -544,7 +555,7 @@ impl<E: Engine> Endpoint<E> {
                     "max_duration_to_get_snapshot" => ?max_duration_to_get_snapshot,
                     "err" => ?e,
                 );
-                Err(Error::DeadlineExceeded)
+                Err(Error::DeadlineExceeded(ctx.is_noisy_tenant))
             }
         }
     }
@@ -1371,10 +1382,13 @@ macro_rules! make_error_response_common {
                 $tag = "meet_lock";
                 $resp.set_locked(info);
             }
-            Error::DeadlineExceeded => {
+            Error::DeadlineExceeded(noisy) => {
                 $tag = "deadline_exceeded";
                 let mut err = errorpb::Error::default();
-                set_deadline_exceeded_busy_error(&mut err);
+                set_deadline_exceeded_busy_error_with_reason(
+                    &mut err,
+                    busy_reason(DEADLINE_EXCEEDED, noisy),
+                );
                 err.set_message($e.to_string());
                 $resp.set_region_error(err);
             }
@@ -1923,6 +1937,7 @@ mod tests {
             TimeStamp::max(),
             None,
             PerfLevel::EnableCount,
+            false,
             false,
         );
         block_on(copr.handle_unary_request(ParseCopRequestResult {
@@ -3360,7 +3375,7 @@ mod tests {
 
     #[test]
     fn test_make_error_response() {
-        let resp = make_error_response(Error::DeadlineExceeded);
+        let resp = make_error_response(Error::DeadlineExceeded(false));
         let region_err = resp.get_region_error();
         assert_eq!(
             region_err.get_server_is_busy().reason,
@@ -3369,6 +3384,27 @@ mod tests {
         assert_eq!(
             region_err.get_message(),
             "Coprocessor task terminated due to exceeding the deadline"
+        );
+    }
+
+    #[test]
+    fn test_a_blamed_tenants_deadline_is_marked_for_backoff() {
+        // Without the marker the client fast-retries a deadline with no
+        // backoff at all, straight back to the same overloaded leader; the
+        // suffix is the only thing that routes it to the backoff path.
+        let plain = make_error_response(Error::DeadlineExceeded(false));
+        assert_eq!(
+            plain.get_region_error().get_server_is_busy().reason,
+            "deadline is exceeded"
+        );
+
+        let blamed = make_error_response(Error::DeadlineExceeded(true));
+        assert_eq!(
+            blamed.get_region_error().get_server_is_busy().reason,
+            format!(
+                "deadline is exceeded{}",
+                resource_control::NOISY_TENANT_REASON_SUFFIX
+            ),
         );
     }
 
@@ -3393,7 +3429,7 @@ mod tests {
             let result =
                 block_on(unsafe { Endpoint::<RocksEngine>::get_snapshot_with_timeout(&req_ctx) });
             assert!(result.is_err());
-            assert!(matches!(result, Err(Error::DeadlineExceeded)));
+            assert!(matches!(result, Err(Error::DeadlineExceeded(_))));
         }
 
         // Test case 2: Snapshot retrieval delayed by failpoint, causing timeout
@@ -3436,7 +3472,7 @@ mod tests {
                     // In production yatp FuturePool environment, this would
                     // timeout correctly
                 } else {
-                    assert!(matches!(result, Err(Error::DeadlineExceeded)));
+                    assert!(matches!(result, Err(Error::DeadlineExceeded(_))));
                     // Verify that timeout happened before the full sleep duration
                     // The timeout should trigger around 100ms, not wait for the full 5000ms sleep
                     assert!(
