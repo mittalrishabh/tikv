@@ -148,7 +148,9 @@ async fn admission_and_enqueue(
     // timed-out delayed task never causes an already-queued task to be dropped.
     let delay = match (resource_manager.as_deref(), resource_limiter.as_deref()) {
         (Some(rm), Some(limiter)) => match rm.admission_decision(true, limiter) {
-            AdmissionDecision::Reject => return Err(ReadPoolError::Rejected),
+            AdmissionDecision::Reject => {
+                return Err(ReadPoolError::Rejected);
+            }
             AdmissionDecision::Delay(d) => {
                 if task_priority == TaskPriority::High {
                     warn!("admission delay on high-priority read task";
@@ -467,6 +469,17 @@ impl ReadPoolHandle {
         }
     }
 
+    /// Whether resource control has named the groups causing an overload.
+    fn overload_is_attributed(&self) -> bool {
+        match self {
+            ReadPoolHandle::Yatp {
+                resource_manager: Some(rm),
+                ..
+            } => rm.has_noisy_groups(),
+            _ => false,
+        }
+    }
+
     /// Bytes, not `&str`: most requests never need the name, so skip UTF-8.
     pub fn check_busy_threshold(
         &self,
@@ -474,6 +487,11 @@ impl ReadPoolHandle {
         resource_group: &[u8],
     ) -> Result<(), errorpb::ServerIsBusy> {
         if busy_threshold.is_zero() {
+            return Ok(());
+        }
+        // This wait is the whole pool's, so attribution is the better answer.
+        if self.overload_is_attributed() {
+            UNIFIED_READ_POOL_BUSY_THRESHOLD_SKIPPED.inc();
             return Ok(());
         }
         let estimated_wait = match self.get_estimated_wait_duration() {
@@ -1166,6 +1184,11 @@ mod metrics {
                 &["resource_group"]
             )
             .unwrap();
+        pub static ref UNIFIED_READ_POOL_BUSY_THRESHOLD_SKIPPED: IntCounter = register_int_counter!(
+            "tikv_unified_read_pool_busy_threshold_skipped_total",
+            "Requests that skipped the estimated-wait gate because resource control manages the read queue"
+        )
+        .unwrap();
         pub static ref UNIFIED_READ_POOL_FULL_REJECTED: IntCounterVec =
             register_int_counter_vec!(
                 "tikv_unified_read_pool_full_rejected_total",
@@ -1194,7 +1217,7 @@ mod tests {
     use futures_executor::block_on;
     use kvproto::kvrpcpb::ResourceControlContext;
     use raftstore::store::{ReadStats, WriteStats};
-    use resource_control::ResourceGroupManager;
+    use resource_control::{config::Config as ResourceControlConfig, ResourceGroupManager};
 
     use super::*;
     use crate::storage::TestEngineBuilder;
@@ -1339,7 +1362,7 @@ mod tests {
 
         thread::sleep(Duration::from_millis(300));
         match block_on(handle.spawn(task3, CommandPri::Normal, 3, TaskMetadata::default(), None)) {
-            Err(ReadPoolError::UnifiedReadPoolFull) => {}
+            Err(ReadPoolError::UnifiedReadPoolFull { .. }) => {}
             _ => panic!("should return full error"),
         }
         // No resource group in the metadata, so the rejection is "default".
@@ -1411,7 +1434,7 @@ mod tests {
 
         thread::sleep(Duration::from_millis(300));
         match block_on(handle.spawn(task3, CommandPri::Normal, 3, TaskMetadata::default(), None)) {
-            Err(ReadPoolError::UnifiedReadPoolFull) => {}
+            Err(ReadPoolError::UnifiedReadPoolFull { .. }) => {}
             _ => panic!("should return full error"),
         }
 
@@ -1423,7 +1446,7 @@ mod tests {
 
         thread::sleep(Duration::from_millis(300));
         match block_on(handle.spawn(task5, CommandPri::Normal, 5, TaskMetadata::default(), None)) {
-            Err(ReadPoolError::UnifiedReadPoolFull) => {}
+            Err(ReadPoolError::UnifiedReadPoolFull { .. }) => {}
             _ => panic!("should return full error"),
         }
     }
@@ -1471,7 +1494,7 @@ mod tests {
 
         thread::sleep(Duration::from_millis(300));
         match block_on(handle.spawn(task3, CommandPri::Normal, 3, TaskMetadata::default(), None)) {
-            Err(ReadPoolError::UnifiedReadPoolFull) => {}
+            Err(ReadPoolError::UnifiedReadPoolFull { .. }) => {}
             _ => panic!("should return full error"),
         }
 
@@ -1496,7 +1519,7 @@ mod tests {
 
         thread::sleep(Duration::from_millis(300));
         match block_on(handle.spawn(task5, CommandPri::Normal, 5, TaskMetadata::default(), None)) {
-            Err(ReadPoolError::UnifiedReadPoolFull) => {}
+            Err(ReadPoolError::UnifiedReadPoolFull { .. }) => {}
             _ => panic!("should return full error"),
         }
     }
@@ -2275,7 +2298,7 @@ mod tests {
             TaskMetadata::from_ctx(&low_ctx),
             None,
         )) {
-            Err(ReadPoolError::UnifiedReadPoolFull) => {}
+            Err(ReadPoolError::UnifiedReadPoolFull { .. }) => {}
             other => panic!(
                 "expected UnifiedReadPoolFull for low-priority task, got {:?}",
                 other.err()
@@ -2396,6 +2419,93 @@ mod tests {
             default_before + 1,
             "it is counted against the default group instead"
         );
+
+        running_tasks[0].sub(500);
+    }
+
+    #[test]
+    fn test_busy_threshold_yields_to_an_attributed_overload() {
+        let config = UnifiedReadPoolConfig {
+            min_thread_count: 1,
+            max_thread_count: 1,
+            max_tasks_per_worker: 100,
+            ..Default::default()
+        };
+        let resource_manager =
+            Arc::new(ResourceGroupManager::new(ResourceControlConfig::default()));
+        resource_manager.add_resource_group(new_resource_group_ru("rc".into(), 5000, 1));
+        let _ctl = resource_manager.derive_controller("read".into(), true);
+        let engine = TestEngineBuilder::new().build().unwrap();
+        let pool = build_yatp_read_pool_with_name(
+            &config,
+            DummyReporter,
+            engine,
+            None,
+            Some(resource_manager.clone()),
+            CleanupMethod::InPlace,
+            "test-busy-threshold-rc".to_owned(),
+            false,
+        );
+        let handle = pool.handle();
+        let (inspector, running_tasks) = match &handle {
+            ReadPoolHandle::Yatp {
+                time_slice_inspector,
+                running_tasks,
+                ..
+            } => (time_slice_inspector, running_tasks),
+            _ => panic!("expected a yatp pool"),
+        };
+        inspector.atomic_ewma_nanos.store(
+            Duration::from_millis(1).as_nanos() as u64,
+            std::sync::atomic::Ordering::Release,
+        );
+        running_tasks[0].add(500);
+        let threshold = Duration::from_millis(100);
+        assert_eq!(
+            handle.get_estimated_wait_duration(),
+            Some(Duration::from_millis(500)),
+            "the wait is still measured, and still reported as a metric"
+        );
+
+        // Nobody named yet, so the gate behaves as it always has.
+        assert!(!resource_manager.has_noisy_groups());
+        handle
+            .check_busy_threshold(threshold, b"rc")
+            .expect_err("with no attribution the advisory applies");
+
+        // A loaded node with background at its floor is what the detector acts on.
+        resource_manager.record_ru_consumption("rc", 10_000_000);
+        resource_manager.set_bg_cpu_at_floor(true);
+        // Two ticks: blame needs `MIN_ENGAGE_TICKS` of sustained overshoot.
+        resource_manager.online_adjust_resource_quota(90.0);
+        resource_manager.online_adjust_resource_quota(90.0);
+        assert!(
+            resource_manager.has_noisy_groups(),
+            "the overload is attributed"
+        );
+
+        let before = UNIFIED_READ_POOL_BUSY_THRESHOLD_SKIPPED.get();
+        handle
+            .check_busy_threshold(threshold, b"rc")
+            .expect("attribution supersedes the whole-pool advisory");
+        assert_eq!(UNIFIED_READ_POOL_BUSY_THRESHOLD_SKIPPED.get(), before + 1);
+
+        // Releasing the scheduler alone is not enough while the throttle holds.
+        resource_manager.reset_group_priorities();
+        assert!(resource_manager.has_noisy_groups(), "still throttled");
+        handle
+            .check_busy_threshold(threshold, b"rc")
+            .expect("and so the gate stays out of the way");
+
+        // A quiet node ramps the limit back, then release finds nothing held.
+        for _ in 0..100 {
+            resource_manager.online_adjust_resource_quota(0.0);
+        }
+        resource_manager.reset_group_priorities();
+        assert!(!resource_manager.has_noisy_groups());
+        handle
+            .check_busy_threshold(threshold, b"rc")
+            .expect_err("with nobody named the advisory applies again");
 
         running_tasks[0].sub(500);
     }
