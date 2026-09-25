@@ -838,8 +838,24 @@ impl ResourceGroupManager {
         }
     }
 
-    /// Whether an actuator holds what this request is charged against.
+    /// Whether a client should be told about noisy groups at all: only once
+    /// fair scheduling or admission control is on. The throttle and detection
+    /// run regardless, but until an operator opts in to one of these, a client
+    /// reacting to the verdict is a behaviour change nobody asked for.
+    pub fn reports_noisy_groups(&self) -> bool {
+        let config = self.config.value();
+        config.enable_fair_scheduling
+            || config.enable_read_admission_control
+            || config.enable_write_admission_control
+    }
+
+    /// Whether an actuator holds what this request is charged against. Always
+    /// false unless [`Self::reports_noisy_groups`], since the only use is the
+    /// marker a client reads.
     pub fn is_noisy_request(&self, group: &str, is_background: bool) -> bool {
+        if !self.reports_noisy_groups() {
+            return false;
+        }
         if is_background {
             return self
                 .bg_limiter
@@ -1045,8 +1061,12 @@ impl ResourceGroupManager {
     /// nothing is blamed; callers that put this on the wire must keep that
     /// distinct from not reporting at all, since a client can only clear what
     /// it knows on the strength of a positive "nobody" answer.
+    ///
+    /// Empty unless [`Self::reports_noisy_groups`]. Empty rather than
+    /// unreported, so that switching the gates off online clears what clients
+    /// already know instead of leaving the groups pinned.
     pub fn noisy_group_names(&self) -> Vec<String> {
-        if !self.has_noisy_groups.load(Ordering::Relaxed) {
+        if !self.reports_noisy_groups() || !self.has_noisy_groups.load(Ordering::Relaxed) {
             return Vec::new();
         }
         self.noisy_groups.read().iter().cloned().collect()
@@ -2013,7 +2033,10 @@ pub(crate) mod tests {
 
     #[test]
     fn test_noisy_group_names_mirrors_the_set() {
-        let mgr = ResourceGroupManager::default();
+        let mgr = ResourceGroupManager::new(Config {
+            enable_fair_scheduling: true,
+            ..Default::default()
+        });
         assert!(mgr.noisy_group_names().is_empty());
 
         mgr.set_noisy_groups(HashSet::from(["tenant1".to_owned(), "tenant2".to_owned()]));
@@ -2808,7 +2831,10 @@ pub(crate) mod tests {
 
     #[test]
     fn test_is_noisy_request_reads_the_actuators_not_a_tick_verdict() {
-        let mgr = ResourceGroupManager::new(Config::default());
+        let mgr = ResourceGroupManager::new(Config {
+            enable_read_admission_control: true,
+            ..Default::default()
+        });
         mgr.add_resource_group(new_resource_group_ru(
             "held".to_owned(),
             1000,
@@ -2863,7 +2889,10 @@ pub(crate) mod tests {
 
     #[test]
     fn test_is_noisy_request_asks_the_background_limiter_for_background_work() {
-        let mgr = ResourceGroupManager::new(Config::default());
+        let mgr = ResourceGroupManager::new(Config {
+            enable_write_admission_control: true,
+            ..Default::default()
+        });
         mgr.add_resource_group(new_background_resource_group_ru(
             "bg".to_owned(),
             1000,
@@ -2892,6 +2921,70 @@ pub(crate) mod tests {
         );
         // Unchanged string, so an older client is unaffected.
         assert_eq!(busy_reason("scheduler is busy", false), "scheduler is busy");
+    }
+
+    #[test]
+    fn test_noisy_groups_are_reported_only_behind_a_gate() {
+        let mgr = ResourceGroupManager::new(Config::default());
+        mgr.add_resource_group(new_resource_group_ru(
+            "held".to_owned(),
+            1000,
+            MEDIUM_PRIORITY,
+        ));
+        let t0 = RuTracker::now_secs();
+        seed_tracker(&mgr, "held", 100.0, 1000.0, t0);
+        mgr.ru_trackers
+            .get("held")
+            .unwrap()
+            .lock()
+            .unwrap()
+            .1
+            .get_limiter(ResourceType::Cpu)
+            .set_rate_limit(500.0);
+        mgr.bg_limiter
+            .get_limiter(ResourceType::Cpu)
+            .set_rate_limit(1000.0);
+        mgr.set_noisy_groups(HashSet::from(["held".to_owned()]));
+
+        // Held and named, but with every gate off nothing reaches a client.
+        assert!(!mgr.reports_noisy_groups());
+        assert!(!mgr.is_noisy_request("held", false));
+        assert!(!mgr.is_noisy_request("held", true));
+        assert!(mgr.noisy_group_names().is_empty());
+        // Detection itself is not gated, only the reporting of it.
+        assert!(mgr.has_noisy_groups());
+
+        // Any one gate is enough.
+        type Gate = fn(&mut Config);
+        let gates: [Gate; 3] = [
+            |c| c.enable_fair_scheduling = true,
+            |c| c.enable_read_admission_control = true,
+            |c| c.enable_write_admission_control = true,
+        ];
+        for enable in gates {
+            let mut cfg = Config::default();
+            enable(&mut cfg);
+            mgr.get_config()
+                .update(|c| -> Result<(), ()> {
+                    *c = cfg.clone();
+                    Ok(())
+                })
+                .unwrap();
+            assert!(mgr.reports_noisy_groups());
+            assert!(mgr.is_noisy_request("held", false));
+            assert!(mgr.is_noisy_request("held", true));
+            assert_eq!(mgr.noisy_group_names(), vec!["held".to_owned()]);
+        }
+
+        // Switched back off online: the names go empty, which clears clients.
+        mgr.get_config()
+            .update(|c| -> Result<(), ()> {
+                *c = Config::default();
+                Ok(())
+            })
+            .unwrap();
+        assert!(!mgr.is_noisy_request("held", false));
+        assert!(mgr.noisy_group_names().is_empty());
     }
 
     #[test]
