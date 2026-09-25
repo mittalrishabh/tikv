@@ -2626,6 +2626,17 @@ mod tests {
         rm.online_adjust_resource_quota(90.0);
         rm.online_adjust_resource_quota(90.0);
 
+        // Held, but with every gate at its default nothing reaches a client.
+        assert!(!sched.is_noisy_write(&cmd_of("rc")));
+
+        // Blame reaches a client only behind a gate; open the write one.
+        rm.get_config()
+            .update(|c| -> Result<(), ()> {
+                c.enable_write_admission_control = true;
+                Ok(())
+            })
+            .unwrap();
+        rm.refresh_cached_config();
         assert!(
             sched.is_noisy_write(&cmd_of("rc")),
             "the group being squeezed is told so"
