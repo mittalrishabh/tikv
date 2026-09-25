@@ -103,6 +103,7 @@ use tikv_util::{
     deadline::Deadline,
     future::try_poll,
     quota_limiter::QuotaLimiter,
+    resource_control::DEFAULT_RESOURCE_GROUP_NAME,
     time::{Instant, InstantExt, ThreadReadId, duration_to_ms, duration_to_sec},
 };
 use tracker::{
@@ -845,6 +846,19 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .get_resource_control_context()
             .get_override_priority();
         let resource_priority = ResourcePriority::from(group_priority);
+        // The whole batch shares a group; bound it to a configured group here so
+        // the consumer can use it directly as a metric label.
+        let resource_group = match self.resource_manager.as_deref() {
+            Some(rm) => rm
+                .bounded_group_name(
+                    requests[0]
+                        .get_context()
+                        .get_resource_control_context()
+                        .get_resource_group_name(),
+                )
+                .into_owned(),
+            None => DEFAULT_RESOURCE_GROUP_NAME.to_owned(),
+        };
         let resource_limiter = self.resource_manager.as_ref().and_then(|r| {
             r.get_resource_limiter(
                 resource_group_name,
@@ -928,7 +942,14 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                             snap_ctx
                         }
                         Err(e) => {
-                            consumer.consume(id, Err(e), begin_instant, source, resource_priority);
+                            consumer.consume(
+                                id,
+                                Err(e),
+                                begin_instant,
+                                source,
+                                resource_priority,
+                                resource_group.clone(),
+                            );
                             continue;
                         }
                     };
@@ -975,6 +996,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                             begin_instant,
                             source,
                             resource_priority,
+                            resource_group.clone(),
                         );
                         continue;
                     }
@@ -1019,6 +1041,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                                         begin_instant,
                                         source,
                                         resource_priority,
+                                        resource_group.clone(),
                                     );
                                 }
                                 Err(e) => {
@@ -1028,12 +1051,20 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                                         begin_instant,
                                         source,
                                         resource_priority,
+                                        resource_group.clone(),
                                     );
                                 }
                             }
                         }),
                         Err(e) => {
-                            consumer.consume(id, Err(e), begin_instant, source, resource_priority);
+                            consumer.consume(
+                                id,
+                                Err(e),
+                                begin_instant,
+                                source,
+                                resource_priority,
+                                resource_group.clone(),
+                            );
                         }
                     }
                 }
@@ -2140,6 +2171,19 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .get_resource_control_context()
             .get_override_priority();
         let resource_priority = ResourcePriority::from(group_priority);
+        // The whole batch shares a group; bound it to a configured group here so
+        // the consumer can use it directly as a metric label.
+        let resource_group = match self.resource_manager.as_deref() {
+            Some(rm) => rm
+                .bounded_group_name(
+                    gets[0]
+                        .get_context()
+                        .get_resource_control_context()
+                        .get_resource_group_name(),
+                )
+                .into_owned(),
+            None => DEFAULT_RESOURCE_GROUP_NAME.to_owned(),
+        };
         let resource_limiter = self.resource_manager.as_ref().and_then(|r| {
             r.get_resource_limiter(
                 resource_group_name,
@@ -2227,6 +2271,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                                         begin_instant,
                                         ctx.take_request_source(),
                                         resource_priority,
+                                        resource_group.clone(),
                                     );
                                     tls_collect_read_flow(
                                         ctx.get_region_id(),
@@ -2243,6 +2288,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                                         begin_instant,
                                         ctx.take_request_source(),
                                         resource_priority,
+                                        resource_group.clone(),
                                     );
                                 }
                             }
@@ -2254,6 +2300,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                                 begin_instant,
                                 ctx.take_request_source(),
                                 resource_priority,
+                                resource_group.clone(),
                             );
                         }
                     }
@@ -3909,6 +3956,7 @@ pub trait ResponseBatchConsumer<ConsumeResponse: Sized>: Send {
         begin: Instant,
         request_source: String,
         resource_priority: ResourcePriority,
+        resource_group: String,
     );
 }
 
@@ -4339,6 +4387,7 @@ pub mod test_util {
             _: Instant,
             _source: String,
             _resource_priority: ResourcePriority,
+            _resource_group: String,
         ) {
             self.data.lock().unwrap().push(GetResult {
                 id,
@@ -4355,6 +4404,7 @@ pub mod test_util {
             _: Instant,
             _source: String,
             _resource_priority: ResourcePriority,
+            _resource_group: String,
         ) {
             self.data.lock().unwrap().push(GetResult { id, res });
         }

@@ -40,6 +40,7 @@ use tikv_util::{
     future::async_timeout,
     memory::{MemoryQuota, OwnedAllocated},
     quota_limiter::QuotaLimiter,
+    resource_control::DEFAULT_RESOURCE_GROUP_NAME,
     store::find_peer,
     time::Instant,
 };
@@ -215,6 +216,18 @@ impl<E: Engine> Endpoint<E> {
 
     pub fn config_manager(&self) -> Box<dyn ConfigManager> {
         Box::new(CopConfigManager::new(self.memory_quota.clone()))
+    }
+
+    /// The group name reaches us from the client, so bound it to a configured
+    /// group before it becomes a metric label -- otherwise any caller could
+    /// mint a permanently retained series. See
+    /// `ResourceGroupManager::bounded_group_name`.
+    fn bounded_group_name(&self, ctx: &kvrpcpb::Context) -> String {
+        let name = ctx.get_resource_control_context().get_resource_group_name();
+        match self.resource_ctl.as_deref() {
+            Some(rm) => rm.bounded_group_name(name).into_owned(),
+            None => DEFAULT_RESOURCE_GROUP_NAME.to_owned(),
+        }
     }
 
     fn check_memory_locks(&self, req_ctx: &ReqContext) -> Result<()> {
@@ -713,7 +726,13 @@ impl<E: Engine> Endpoint<E> {
             )
         });
         // box the tracker so that moving it is cheap.
-        let tracker = Box::new(Tracker::new(req_ctx, req_tag, self.slow_log_threshold));
+        let resource_group = self.bounded_group_name(&req_ctx.context);
+        let tracker = Box::new(Tracker::new(
+            req_ctx,
+            req_tag,
+            self.slow_log_threshold,
+            resource_group,
+        ));
         allocated_bytes += tracker.approximate_mem_size();
 
         let (tx, rx) = oneshot::channel();
@@ -1171,7 +1190,13 @@ impl<E: Engine> Endpoint<E> {
         let mut allocated_bytes = resource_tag.approximate_heap_size();
 
         let task_id = req_ctx.build_task_id();
-        let tracker = Box::new(Tracker::new(req_ctx, req_tag, self.slow_log_threshold));
+        let resource_group = self.bounded_group_name(&req_ctx.context);
+        let tracker = Box::new(Tracker::new(
+            req_ctx,
+            req_tag,
+            self.slow_log_threshold,
+            resource_group,
+        ));
         allocated_bytes += tracker.approximate_mem_size();
 
         let future = Self::handle_stream_request_impl(
@@ -2290,6 +2315,7 @@ mod tests {
                     ReqContext::default_for_test(),
                     ReqTag::analyze_full_sampling,
                     slow_log_threshold,
+                    tikv_util::resource_control::DEFAULT_RESOURCE_GROUP_NAME.to_owned(),
                 )),
                 background_handler,
                 UnaryOutputMode::Materialize,
@@ -2317,6 +2343,7 @@ mod tests {
                     ReqContext::default_for_test(),
                     ReqTag::test,
                     slow_log_threshold,
+                    tikv_util::resource_control::DEFAULT_RESOURCE_GROUP_NAME.to_owned(),
                 )),
                 shared_handler,
                 UnaryOutputMode::Materialize,
