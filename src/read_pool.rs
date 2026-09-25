@@ -814,6 +814,9 @@ impl ReadPoolCpuTimeTracker {
     }
 }
 struct ReadPoolConfigRunner {
+    // The period the timer last slept for, and so the window the tick's
+    // measurements cover. `on_timeout` re-picks it after the adjustment, which
+    // is what keeps it equal to the elapsed time rather than the next period.
     interval: Duration,
     sender: SyncSender<usize>,
     handle: ReadPoolHandle,
@@ -864,6 +867,11 @@ impl RunnableWithTimer for ReadPoolConfigRunner {
 
     fn on_timeout(&mut self) {
         self.adjust_pool_size();
+        // Re-picked every tick, and after the adjustment so a tick that has
+        // just found the node loaded is followed by a fast one. Outside
+        // adjust_pool_size because that returns early when auto_adjust is off,
+        // and the period should not be frozen by it.
+        self.interval = self.control_tick();
     }
 }
 
@@ -874,6 +882,20 @@ impl ReadPoolConfigRunner {
                 running_tasks.iter().map(|r| r.get()).sum()
             }
             _ => unreachable!(),
+        }
+    }
+
+    // The period for the next tick, from the resource manager's last verdict:
+    // shorter while the node is loaded. CONTROL_TICK when resource control is
+    // off, which is the only case where there is no verdict to follow.
+    fn control_tick(&self) -> Duration {
+        match &self.handle {
+            ReadPoolHandle::Yatp {
+                resource_manager, ..
+            } => resource_manager
+                .as_ref()
+                .map_or(CONTROL_TICK, |rm| rm.control_tick()),
+            _ => CONTROL_TICK,
         }
     }
 

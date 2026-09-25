@@ -57,8 +57,12 @@ const HIGH_PRIORITY: u32 = 16;
 // virtual time overflow.
 const RESET_VT_THRESHOLD: u64 = (u64::MAX >> 4) / 2;
 
-/// Period of both control loops; every `*_PCT` below is per tick.
+/// Period of both control loops while quiet; every `*_PCT` below is per tick.
+/// Default for `resource-control.quiet-tick`.
 pub const CONTROL_TICK: Duration = Duration::from_secs(10);
+
+/// Default for `resource-control.overloaded-tick`: the period while loaded.
+pub const CONTROL_TICK_OVERLOADED: Duration = Duration::from_secs(5);
 
 /// Margin below a setpoint before a controller expands into it.
 const LEEWAY_PCT: f64 = 10.0;
@@ -470,6 +474,9 @@ pub struct ResourceGroupManager {
     read_pool_scale_up_allowed: AtomicBool,
     // The groups the last tick blamed: one writer, both actuators reading.
     noisy_groups: RwLock<HashSet<String>>,
+    // Last tick's `loaded` verdict, so both control loops can pick their period
+    // without recomputing the score on the read pool's own clock.
+    overloaded: AtomicBool,
 }
 
 impl Default for ResourceGroupManager {
@@ -593,6 +600,7 @@ impl ResourceGroupManager {
             read_pool_cpu_tracker: Mutex::new(RuTracker::new(start_secs, num_buckets)),
             read_pool_scale_up_allowed: AtomicBool::new(false),
             noisy_groups: RwLock::new(HashSet::new()),
+            overloaded: AtomicBool::new(false),
         };
 
         // init the default resource group by default.
@@ -822,6 +830,28 @@ impl ResourceGroupManager {
         );
     }
 
+    /// The period both control loops should run at, from the last tick's
+    /// verdict: `overloaded_tick` while the node is loaded, so detection
+    /// reaches a verdict sooner, and `quiet_tick` otherwise.
+    ///
+    /// Relaxed, and read a tick late by design: the worst case is one tick at
+    /// the wrong period on either side of a transition.
+    pub fn control_tick(&self) -> Duration {
+        let config = self.config.value();
+        if self.overloaded.load(Ordering::Relaxed) {
+            config.overloaded_tick.0
+        } else {
+            config.quiet_tick.0
+        }
+    }
+
+    /// The faster of the two periods, and so the rate the tick task has to be
+    /// woken at: [`Self::control_tick`] can defer a wakeup into the quiet
+    /// period but cannot create one.
+    pub fn overloaded_tick(&self) -> Duration {
+        self.config.value().overloaded_tick.0
+    }
+
     /// Record `ru` units consumed by `group` into the sliding-window tracker
     /// and consume tokens from the group's rate limiter.
     pub fn record_ru_consumption(&self, group: &str, ru: u64) {
@@ -910,6 +940,10 @@ impl ResourceGroupManager {
         let loaded = cpu_score > threshold;
         let cleared = cpu_score < threshold * LEEWAY_FACTOR;
         let quiet = cpu_score < threshold * BASELINE_QUIET_FACTOR;
+        // Both loops read this to pick their next period. `loaded` rather than
+        // `under_pressure`: the faster tick is wanted while the evidence is
+        // still being gathered, which is before background has yielded.
+        self.overloaded.store(loaded, Ordering::Relaxed);
 
         // A group over its average is no problem on an idle node.
         let under_pressure = loaded && self.is_bg_cpu_at_floor();
@@ -2679,6 +2713,28 @@ pub(crate) mod tests {
             0.0,
             "the gauge must be dropped on eviction, not left holding its last value"
         );
+    }
+
+    #[test]
+    fn test_control_tick_follows_the_load() {
+        let mgr = ResourceGroupManager::new(Config::default());
+        let threshold = mgr.config.value().fg_cpu_throttle_threshold;
+
+        // Nothing measured yet, so the quiet period rather than the fast one:
+        // a node is not assumed loaded until a tick says so.
+        assert_eq!(mgr.control_tick(), CONTROL_TICK);
+
+        mgr.online_adjust_resource_quota(threshold + 10.0);
+        assert_eq!(mgr.control_tick(), CONTROL_TICK_OVERLOADED);
+
+        // Still loaded while merely inside the leeway band, which is the band
+        // that holds the candidacy counter rather than clearing it.
+        mgr.online_adjust_resource_quota(threshold + 0.1);
+        assert_eq!(mgr.control_tick(), CONTROL_TICK_OVERLOADED);
+
+        // And back, so an idle node stops paying for the faster tick.
+        mgr.online_adjust_resource_quota(threshold - 10.0);
+        assert_eq!(mgr.control_tick(), CONTROL_TICK);
     }
 
     #[test]
