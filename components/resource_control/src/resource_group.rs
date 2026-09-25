@@ -486,6 +486,8 @@ pub struct ResourceGroupManager {
     read_pool_cpu_pressure: AtomicU64,
     // `Config::request_base_cost_micros`, mirrored out of the config lock.
     request_base_cost_micros: AtomicU64,
+    // `reports_noisy_groups`'s gate, off the config lock: asked per request.
+    reports_noisy_groups: AtomicBool,
     // Bucket count for a new tracker; the window is not hot-reloadable.
     ru_num_buckets: usize,
     // The read pool's own CPU tracker; its `quiet_baseline` is the floor.
@@ -606,6 +608,7 @@ impl ResourceGroupManager {
         // 2 buckets per minute (30s each), as the per-group trackers use.
         let num_buckets = (config.historical_usage_window_mins.max(2) as usize) * 2;
         let request_base_cost_micros = config.request_base_cost_micros;
+        let reports_noisy_groups = config.reports_noisy_groups();
         let manager = Self {
             resource_groups: Default::default(),
             group_count: AtomicU64::new(0),
@@ -621,6 +624,7 @@ impl ResourceGroupManager {
             bg_cpu_at_floor: AtomicBool::new(false),
             read_pool_cpu_pressure: AtomicU64::new(0.0f64.to_bits()),
             request_base_cost_micros: AtomicU64::new(request_base_cost_micros),
+            reports_noisy_groups: AtomicBool::new(reports_noisy_groups),
             read_pool_cpu_tracker: Mutex::new(RuTracker::new(start_secs, num_buckets)),
             read_pool_scale_up_allowed: AtomicBool::new(false),
             noisy_groups: RwLock::new(HashSet::new()),
@@ -842,11 +846,10 @@ impl ResourceGroupManager {
     /// fair scheduling or admission control is on. The throttle and detection
     /// run regardless, but until an operator opts in to one of these, a client
     /// reacting to the verdict is a behaviour change nobody asked for.
+    ///
+    /// Read from the cache `refresh_cached_config` keeps, not the config lock.
     pub fn reports_noisy_groups(&self) -> bool {
-        let config = self.config.value();
-        config.enable_fair_scheduling
-            || config.enable_read_admission_control
-            || config.enable_write_admission_control
+        self.reports_noisy_groups.load(Ordering::Relaxed)
     }
 
     /// Whether an actuator holds what this request is charged against. Always
@@ -882,6 +885,8 @@ impl ResourceGroupManager {
         let config = self.config.value();
         self.request_base_cost_micros
             .store(config.request_base_cost_micros, Ordering::Relaxed);
+        self.reports_noisy_groups
+            .store(config.reports_noisy_groups(), Ordering::Relaxed);
     }
 
     /// Whether an overload has been detected and attributed to some group.
@@ -2970,6 +2975,8 @@ pub(crate) mod tests {
                     Ok(())
                 })
                 .unwrap();
+            // Written past the dispatcher, so refresh as a tick would.
+            mgr.refresh_cached_config();
             assert!(mgr.reports_noisy_groups());
             assert!(mgr.is_noisy_request("held", false));
             assert!(mgr.is_noisy_request("held", true));
@@ -2983,6 +2990,7 @@ pub(crate) mod tests {
                 Ok(())
             })
             .unwrap();
+        mgr.refresh_cached_config();
         assert!(!mgr.is_noisy_request("held", false));
         assert!(mgr.noisy_group_names().is_empty());
     }

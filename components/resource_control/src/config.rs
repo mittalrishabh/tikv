@@ -159,6 +159,15 @@ fn validate_cpu_pct(name: &str, value: f64) -> Result<(), Box<dyn Error>> {
 }
 
 impl Config {
+    /// Whether a client should be told about noisy groups: only once fair
+    /// scheduling or admission control is on. See
+    /// [`ResourceGroupManager::reports_noisy_groups`].
+    pub fn reports_noisy_groups(&self) -> bool {
+        self.enable_fair_scheduling
+            || self.enable_read_admission_control
+            || self.enable_write_admission_control
+    }
+
     pub fn validate(&self) -> Result<(), Box<dyn Error>> {
         validate_cpu_pct("bg-cpu-throttle-threshold", self.bg_cpu_throttle_threshold)?;
         validate_cpu_pct("fg-cpu-throttle-threshold", self.fg_cpu_throttle_threshold)?;
@@ -518,5 +527,25 @@ mod tests {
         mgr.dispatch(change).unwrap();
 
         assert_eq!(config.value().fg_cpu_throttle_threshold, 90.0);
+    }
+
+    /// An online change to the noisy-group reporting gate reaches the cached
+    /// copy the coprocessor reads per request on the next tick's refresh.
+    #[test]
+    fn test_online_change_reaches_cached_noisy_reporting_gate() {
+        let resource_ctl = crate::ResourceGroupManager::new(Config::default());
+        let mut mgr = ResourceContrlCfgMgr::new(resource_ctl.get_config().clone());
+        assert!(!resource_ctl.reports_noisy_groups());
+
+        for (name, on) in [
+            ("enable_read_admission_control", true),
+            ("enable_read_admission_control", false),
+        ] {
+            let mut change = ConfigChange::new();
+            change.insert(name.to_owned(), ConfigValue::Bool(on));
+            mgr.dispatch(change).unwrap();
+            resource_ctl.refresh_cached_config();
+            assert_eq!(resource_ctl.reports_noisy_groups(), on, "{name}={on}");
+        }
     }
 }
