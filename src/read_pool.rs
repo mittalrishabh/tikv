@@ -478,6 +478,17 @@ impl ReadPoolHandle {
         }
     }
 
+    /// Whether resource control has named the groups causing an overload.
+    fn overload_is_attributed(&self) -> bool {
+        match self {
+            ReadPoolHandle::Yatp {
+                resource_manager: Some(rm),
+                ..
+            } => rm.has_noisy_groups(),
+            _ => false,
+        }
+    }
+
     /// Whether this request's group is itself being shed; the same predicate
     /// the spawn path puts on `ReadPoolError`. Background is classified from
     /// `request_source`, as the write scheduler does.
@@ -503,24 +514,22 @@ impl ReadPoolHandle {
         if busy_threshold.is_zero() {
             return Ok(());
         }
+        // This wait is the whole pool's, so attribution is the better answer.
+        if self.overload_is_attributed() {
+            UNIFIED_READ_POOL_BUSY_THRESHOLD_SKIPPED.inc();
+            return Ok(());
+        }
         let estimated_wait = match self.get_estimated_wait_duration() {
             Some(estimated_wait) if estimated_wait > busy_threshold => estimated_wait,
             _ => return Ok(()),
         };
-        let group = std::str::from_utf8(resource_group).unwrap_or_default();
-        // Only a held group skips: it is already being shed. Everyone else, and
-        // everyone while reporting is off, keeps the replica-redirect hint. No
-        // request source reaches here; this is a foreground hint, judged so.
-        if self.is_noisy_request(group, "") {
-            UNIFIED_READ_POOL_BUSY_THRESHOLD_SKIPPED.inc();
-            return Ok(());
-        }
         // TODO: Get applied_index from the raftstore and check memory locks. Then, we
         // can skip read index in replica read. But now the difficulty is that we don't
         // have access to the the local reader in gRPC threads.
         let mut busy_err = errorpb::ServerIsBusy::default();
         busy_err.set_reason("estimated wait time exceeds threshold".to_owned());
         busy_err.estimated_wait_ms = u32::try_from(estimated_wait.as_millis()).unwrap_or(u32::MAX);
+        let group = std::str::from_utf8(resource_group).unwrap_or_default();
         UNIFIED_READ_POOL_BUSY_THRESHOLD_REJECTED
             .with_label_values(&[self.bounded_group_label(group).as_ref()])
             .inc();
@@ -1202,7 +1211,7 @@ mod metrics {
             .unwrap();
         pub static ref UNIFIED_READ_POOL_BUSY_THRESHOLD_SKIPPED: IntCounter = register_int_counter!(
             "tikv_unified_read_pool_busy_threshold_skipped_total",
-            "Requests from a held group that skipped the estimated-wait gate, since resource control is already shedding that group. Zero unless noisy-group reporting is enabled"
+            "Requests that skipped the estimated-wait gate because resource control manages the read queue"
         )
         .unwrap();
         pub static ref UNIFIED_READ_POOL_FULL_REJECTED: IntCounterVec =
@@ -2440,7 +2449,7 @@ mod tests {
     }
 
     #[test]
-    fn test_busy_threshold_yields_only_for_a_held_group_when_reporting() {
+    fn test_busy_threshold_yields_to_an_attributed_overload() {
         let config = UnifiedReadPoolConfig {
             min_thread_count: 1,
             max_thread_count: 1,
@@ -2450,7 +2459,6 @@ mod tests {
         let resource_manager =
             Arc::new(ResourceGroupManager::new(ResourceControlConfig::default()));
         resource_manager.add_resource_group(new_resource_group_ru("rc".into(), 5000, 1));
-        resource_manager.add_resource_group(new_resource_group_ru("bystander".into(), 5000, 1));
         let _ctl = resource_manager.derive_controller("read".into(), true);
         let engine = TestEngineBuilder::new().build().unwrap();
         let pool = build_yatp_read_pool_with_name(
@@ -2501,31 +2509,10 @@ mod tests {
             "the overload is attributed"
         );
 
-        // Detection runs with every gate off, but nothing it finds may reach a
-        // client: the advisory is unchanged for the held group and everyone.
-        handle
-            .check_busy_threshold(threshold, b"rc")
-            .expect_err("with reporting off the advisory is unchanged");
-        handle
-            .check_busy_threshold(threshold, b"bystander")
-            .expect_err("with reporting off the advisory is unchanged");
-
-        // Opted in: only the held group's own requests skip the advisory.
-        resource_manager
-            .get_config()
-            .update(|c| -> Result<(), ()> {
-                c.enable_read_admission_control = true;
-                Ok(())
-            })
-            .unwrap();
-        resource_manager.refresh_cached_config();
-        handle
-            .check_busy_threshold(threshold, b"bystander")
-            .expect_err("a group nobody holds keeps the replica-redirect hint");
         let before = UNIFIED_READ_POOL_BUSY_THRESHOLD_SKIPPED.get();
         handle
             .check_busy_threshold(threshold, b"rc")
-            .expect("the held group is already being shed");
+            .expect("attribution supersedes the whole-pool advisory");
         assert_eq!(UNIFIED_READ_POOL_BUSY_THRESHOLD_SKIPPED.get(), before + 1);
 
         // Releasing the scheduler alone is not enough while the throttle holds.

@@ -85309,7 +85309,7 @@
           "bars": false,
           "cacheTimeout": null,
           "datasource": "${DS_TEST-CLUSTER}",
-          "description": "Read pool admission outcomes. `busy-threshold` is the client's own gate, sent as `busy_threshold_ms` from TiDB's `tidb_load_based_replica_read_threshold`: TiKV answers ServerIsBusy with its estimated wait and the client retries the read on an idle follower, so a high rate here is a redirect signal, not an error rate. `pool-full` is the queue capacity gate and has no such fallback -- the client sees a retry against the same leader. `busy-threshold-skipped` is neither: it counts requests from a held group that bypassed the estimated-wait gate because resource control is already shedding that group. Other groups keep the redirect, and it stays at zero unless noisy-group reporting is enabled.",
+          "description": "Read pool admission outcomes. `busy-threshold` is the client's own gate, sent as `busy_threshold_ms` from TiDB's `tidb_load_based_replica_read_threshold`: TiKV answers ServerIsBusy with its estimated wait and the client retries the read on an idle follower, so a high rate here is a redirect signal, not an error rate. `pool-full` is the queue capacity gate and has no such fallback -- the client sees a retry against the same leader. `busy-threshold-skipped` is neither: it counts requests that bypassed the estimated-wait gate because resource control owns the read queue for them, so it should rise as the other two fall.",
           "editable": true,
           "error": false,
           "fieldConfig": {
