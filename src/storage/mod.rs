@@ -127,7 +127,7 @@ pub use self::{
     },
 };
 use crate::{
-    read_pool::{ReadPool, ReadPoolHandle},
+    read_pool::{ReadPool, ReadPoolError, ReadPoolHandle},
     server::{lock_manager::waiter_manager, metrics::ResourcePriority},
     storage::{
         config::Config,
@@ -1857,10 +1857,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             metadata,
             resource_limiter,
         );
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+        async move { res.map_err(read_pool_spawn_error).await? }
     }
 
     // The entry point of the storage scheduler. Not only transaction commands need
@@ -3366,10 +3363,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             resource_limiter,
         );
 
-        async move {
-            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
-                .await?
-        }
+        async move { res.map_err(read_pool_spawn_error).await? }
     }
 
     fn read_pool_spawn_with_busy_check<Fut, T>(
@@ -3399,7 +3393,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         FuturesEither::Right(async move {
             read_pool
                 .spawn_handle(future, priority, task_id, metadata, resource_limiter)
-                .map_err(|_| Error::from(ErrorInner::SchedTooBusy))
+                .map_err(read_pool_spawn_error)
                 .await?
         })
     }
@@ -3485,6 +3479,16 @@ pub struct DynamicConfigs {
     pub wake_up_delay_duration_ms: Arc<AtomicU64>,
     pub in_memory_peer_size_limit: Arc<AtomicU64>,
     pub in_memory_instance_size_limit: Arc<AtomicU64>,
+}
+
+/// Only the two load-shedding paths carry `noisy`; the rest stay plain.
+fn read_pool_spawn_error(err: ReadPoolError) -> Error {
+    match err {
+        ReadPoolError::UnifiedReadPoolFull { noisy } | ReadPoolError::Rejected { noisy } => {
+            Error::from(ErrorInner::QueueTooBusy { noisy })
+        }
+        _ => Error::from(ErrorInner::SchedTooBusy),
+    }
 }
 
 fn get_priority_tag(priority: CommandPri) -> CommandPriority {
@@ -3976,7 +3980,8 @@ pub mod test_util {
         Box::new(move |x: Result<T>| {
             expect_error(
                 |err| match err {
-                    Error(box ErrorInner::SchedTooBusy) => {}
+                    Error(box ErrorInner::SchedTooBusy)
+                    | Error(box ErrorInner::QueueTooBusy { .. }) => {}
                     e => panic!("unexpected error chain: {:?}, expect too busy", e),
                 },
                 x,
@@ -4469,6 +4474,37 @@ mod tests {
             types::{PessimisticLockKeyResult, PessimisticLockResults},
         },
     };
+
+    /// Both shedding paths must carry the verdict; nothing else may.
+    #[test]
+    fn test_read_pool_spawn_error_carries_the_noisy_verdict() {
+        let noisy_of = |err: ReadPoolError| match read_pool_spawn_error(err) {
+            Error(box ErrorInner::QueueTooBusy { noisy }) => Some(noisy),
+            _ => None,
+        };
+        assert_eq!(
+            noisy_of(ReadPoolError::UnifiedReadPoolFull { noisy: true }),
+            Some(true)
+        );
+        assert_eq!(
+            noisy_of(ReadPoolError::UnifiedReadPoolFull { noisy: false }),
+            Some(false)
+        );
+        assert_eq!(
+            noisy_of(ReadPoolError::Rejected { noisy: true }),
+            Some(true)
+        );
+        assert_eq!(
+            noisy_of(ReadPoolError::Rejected { noisy: false }),
+            Some(false)
+        );
+
+        // A cancelled task is not load shedding, so it stays plain.
+        assert!(matches!(
+            read_pool_spawn_error(ReadPoolError::Canceled(futures::channel::oneshot::Canceled)),
+            Error(box ErrorInner::SchedTooBusy)
+        ));
+    }
 
     #[test]
     fn test_prewrite_blocks_read() {

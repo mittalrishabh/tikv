@@ -95,6 +95,18 @@ const TAIL_EXCESS_RATIO: f64 = 0.1;
 /// Duration of each bucket in the RuTracker ring buffer.
 const RU_BUCKET_SECS: u64 = 30;
 
+/// Appended to `ServerIsBusy.reason` when the requester's own group is noisy.
+pub const NOISY_TENANT_REASON_SUFFIX: &str = "|noisy_tenant";
+
+/// Unchanged string unless `noisy`, so an older client is unaffected.
+pub fn busy_reason(reason: &str, noisy: bool) -> String {
+    if noisy {
+        format!("{reason}{NOISY_TENANT_REASON_SUFFIX}")
+    } else {
+        reason.to_owned()
+    }
+}
+
 /// Floor the read pool's CPU ceiling never ratchets below, in cores.
 const MIN_READ_POOL_TARGET_CORES: f64 = 1.0;
 
@@ -824,6 +836,20 @@ impl ResourceGroupManager {
         } else {
             Cow::Borrowed(DEFAULT_RESOURCE_GROUP_NAME)
         }
+    }
+
+    /// Whether an actuator holds what this request is charged against.
+    pub fn is_noisy_request(&self, group: &str, is_background: bool) -> bool {
+        if is_background {
+            return self
+                .bg_limiter
+                .get_limiter(ResourceType::Cpu)
+                .get_rate_limit()
+                .is_finite();
+        }
+        self.ru_trackers
+            .get(self.bounded_group_name(group).as_ref())
+            .is_some_and(|entry| is_held(&entry.lock().unwrap()))
     }
 
     /// Charges `group` the fixed arrival cost, whether it runs or not.
@@ -2751,6 +2777,94 @@ pub(crate) mod tests {
             0.0,
             "the gauge must be dropped on eviction, not left holding its last value"
         );
+    }
+
+    #[test]
+    fn test_is_noisy_request_reads_the_actuators_not_a_tick_verdict() {
+        let mgr = ResourceGroupManager::new(Config::default());
+        mgr.add_resource_group(new_resource_group_ru(
+            "held".to_owned(),
+            1000,
+            MEDIUM_PRIORITY,
+        ));
+        mgr.add_resource_group(new_resource_group_ru(
+            "free".to_owned(),
+            1000,
+            MEDIUM_PRIORITY,
+        ));
+        let t0 = RuTracker::now_secs();
+        seed_tracker(&mgr, "held", 100.0, 1000.0, t0);
+        seed_tracker(&mgr, "free", 100.0, 105.0, t0);
+
+        // Over baseline is not noisy until an actuator acts.
+        assert!(!mgr.is_noisy_request("held", false));
+        assert!(!mgr.is_noisy_request("free", false));
+
+        // Deprioritized: the priority half of the test.
+        mgr.ru_trackers
+            .get("held")
+            .unwrap()
+            .lock()
+            .unwrap()
+            .0
+            .set_scheduler_backpressure(true);
+        assert!(mgr.is_noisy_request("held", false));
+        assert!(!mgr.is_noisy_request("free", false));
+
+        // Throttled: a finite CPU rate limit alone is enough.
+        mgr.ru_trackers
+            .get("held")
+            .unwrap()
+            .lock()
+            .unwrap()
+            .0
+            .set_scheduler_backpressure(false);
+        assert!(!mgr.is_noisy_request("held", false));
+        mgr.ru_trackers
+            .get("held")
+            .unwrap()
+            .lock()
+            .unwrap()
+            .1
+            .get_limiter(ResourceType::Cpu)
+            .set_rate_limit(500.0);
+        assert!(mgr.is_noisy_request("held", false));
+
+        // An unconfigured name falls back to the default group.
+        assert!(!mgr.is_noisy_request("no-such-group", false));
+    }
+
+    #[test]
+    fn test_is_noisy_request_asks_the_background_limiter_for_background_work() {
+        let mgr = ResourceGroupManager::new(Config::default());
+        mgr.add_resource_group(new_background_resource_group_ru(
+            "bg".to_owned(),
+            1000,
+            LOW_PRIORITY,
+            vec!["br".to_owned()],
+        ));
+        let bg = mgr.get_background_limiter();
+        assert!(bg.is_background());
+
+        // Unlimited: nothing is holding background work.
+        assert!(!mgr.is_noisy_request("bg", true));
+
+        // `background_adjust_quota` gives it a finite CPU budget.
+        bg.get_limiter(ResourceType::Cpu).set_rate_limit(1000.0);
+        assert!(mgr.is_noisy_request("bg", true));
+
+        // Foreground in the same group is metered by the group's own limiter.
+        assert!(!mgr.is_noisy_request("bg", false));
+    }
+
+    #[test]
+    fn test_busy_reason_only_marks_the_noisy_tenant() {
+        assert_eq!(
+            busy_reason("scheduler is busy", true),
+            "scheduler is busy|noisy_tenant"
+        );
+        // Unchanged string, so an older client is unaffected.
+        assert_eq!(busy_reason("scheduler is busy", false), "scheduler is busy");
     }
 
     #[test]

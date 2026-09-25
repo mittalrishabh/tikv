@@ -20,7 +20,7 @@ use tokio::{sync::Semaphore, task::yield_now};
 use super::{
     Error, HandlerOutput, HandlerOutputState, MergeableResult, ResponseMaterializationFailure,
     TracedResponse,
-    endpoint::{make_error_batch_response, make_error_response},
+    endpoint::{make_error_batch_response, make_error_response, read_pool_spawn_error},
     metrics::record_coprocessor_response_size,
 };
 use crate::read_pool::ReadPoolHandle;
@@ -132,7 +132,7 @@ impl BatchMergeFinalizer {
         let submission_error = match async_timeout(submission, deadline.remaining_duration()).await
         {
             Ok(Ok(())) => None,
-            Ok(Err(_)) => Some(Error::MaxPendingTasksExceeded),
+            Ok(Err(e)) => Some(read_pool_spawn_error(e)),
             Err(_) => Some(Error::DeadlineExceeded),
         };
         // Error returns here and below drop the completed outputs along with
@@ -148,14 +148,14 @@ impl BatchMergeFinalizer {
             Ok(Ok(response)) => {
                 return account_returned_response(response, &returned_response_tag, tracker);
             }
-            Ok(Err(_)) => Error::MaxPendingTasksExceeded,
+            Ok(Err(_)) => Error::MaxPendingTasksExceeded(false),
             Err(_) => match response_rx.try_recv() {
                 // The response may already be ready when the timeout wins the poll race.
                 Ok(Some(response)) => {
                     return account_returned_response(response, &returned_response_tag, tracker);
                 }
                 Ok(None) => Error::DeadlineExceeded,
-                Err(_) => Error::MaxPendingTasksExceeded,
+                Err(_) => Error::MaxPendingTasksExceeded(false),
             },
         };
         make_error_response(completion_error).into()

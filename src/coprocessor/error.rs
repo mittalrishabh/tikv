@@ -24,8 +24,9 @@ pub enum Error {
     #[error("Coprocessor task terminated due to exceeding the deadline")]
     DeadlineExceeded,
 
+    /// True when the requesting group is itself the noisy one.
     #[error("Coprocessor task canceled due to exceeding max pending tasks")]
-    MaxPendingTasksExceeded,
+    MaxPendingTasksExceeded(bool),
 
     #[error("Coprocessor task canceled due to exceeding memory quota")]
     MemoryQuotaExceeded,
@@ -144,7 +145,9 @@ impl ErrorCodeExt for Error {
             Error::Region(e) => e.error_code(),
             Error::Locked(_) => error_code::coprocessor::LOCKED,
             Error::DeadlineExceeded => error_code::coprocessor::DEADLINE_EXCEEDED,
-            Error::MaxPendingTasksExceeded => error_code::coprocessor::MAX_PENDING_TASKS_EXCEEDED,
+            Error::MaxPendingTasksExceeded(_) => {
+                error_code::coprocessor::MAX_PENDING_TASKS_EXCEEDED
+            }
             Error::MemoryQuotaExceeded => error_code::coprocessor::MEMORY_QUOTA_EXCEEDED,
             Error::InvalidMaxTsUpdate(_) => error_code::coprocessor::INVALID_MAX_TS_UPDATE,
             Error::DefaultNotFound { .. } => error_code::coprocessor::DEFAULT_NOT_FOUND,

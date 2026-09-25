@@ -143,13 +143,17 @@ async fn admission_and_enqueue(
     running_tasks: Vec<IntGauge>,
     resource_ctl: Option<Arc<ResourceController>>,
     estimated_priority: u64,
+    is_background: bool,
 ) -> Result<(), ReadPoolError> {
     // Admission control runs before any eviction so that a rejected or
     // timed-out delayed task never causes an already-queued task to be dropped.
     let delay = match (resource_manager.as_deref(), resource_limiter.as_deref()) {
         (Some(rm), Some(limiter)) => match rm.admission_decision(true, limiter) {
+            // Ask anyway, so both rejection paths answer the same way.
             AdmissionDecision::Reject => {
-                return Err(ReadPoolError::Rejected);
+                return Err(ReadPoolError::Rejected {
+                    noisy: rm.is_noisy_request(limiter.name(), is_background),
+                });
             }
             AdmissionDecision::Delay(d) => {
                 if task_priority == TaskPriority::High {
@@ -189,14 +193,18 @@ async fn admission_and_enqueue(
                 let meta = TaskMetadata::from(task_cell.mut_extras().metadata());
                 // Bound the client-supplied name before it becomes a label.
                 let name = std::str::from_utf8(meta.group_name()).unwrap_or_default();
-                let label = match resource_manager.as_deref() {
-                    Some(rm) => rm.bounded_group_name(name),
-                    None => Cow::Borrowed(DEFAULT_RESOURCE_GROUP_NAME),
+                let (label, noisy) = match resource_manager.as_deref() {
+                    Some(rm) => (
+                        rm.bounded_group_name(name),
+                        rm.is_noisy_request(name, is_background),
+                    ),
+                    None => (Cow::Borrowed(DEFAULT_RESOURCE_GROUP_NAME), false),
                 };
                 UNIFIED_READ_POOL_FULL_REJECTED
                     .with_label_values(&[label.as_ref()])
                     .inc();
-                return Err(ReadPoolError::UnifiedReadPoolFull);
+                // Hard rejection, but the requester still learns whose fault it was.
+                return Err(ReadPoolError::UnifiedReadPoolFull { noisy });
             }
         }
     }
@@ -334,6 +342,7 @@ impl ReadPoolHandle {
                     running_tasks.to_vec(),
                     resource_ctl.clone(),
                     estimated_priority,
+                    is_background,
                 )
                 .boxed()
             }
@@ -1145,10 +1154,10 @@ pub enum ReadPoolError {
     FuturePoolFull(#[from] yatp_pool::Full),
 
     #[error("Unified read pool is full")]
-    UnifiedReadPoolFull,
+    UnifiedReadPoolFull { noisy: bool },
 
     #[error("Request rejected by admission control")]
-    Rejected,
+    Rejected { noisy: bool },
 
     #[error("{0}")]
     Canceled(#[from] oneshot::Canceled),

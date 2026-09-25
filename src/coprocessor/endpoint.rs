@@ -23,7 +23,7 @@ use futures::{
 use kvproto::{coprocessor as coppb, errorpb, kvrpcpb, kvrpcpb::CommandPri, metapb};
 use online_config::ConfigManager;
 use protobuf::{CodedInputStream, Message};
-use resource_control::{ResourceGroupManager, ResourceLimiter, TaskMetadata};
+use resource_control::{busy_reason, ResourceGroupManager, ResourceLimiter, TaskMetadata};
 use resource_metering::{
     FutureExt, ResourceTagFactory, StreamExt, record_logical_read_bytes, record_network_in_bytes,
     record_network_out_bytes,
@@ -52,7 +52,7 @@ use crate::{
         batch::*, cache::CachedRequestHandler, interceptors::*, metrics::*,
         statistics::analyze_context::AnalyzeContext, tracker::Tracker, *,
     },
-    read_pool::ReadPoolHandle,
+    read_pool::{ReadPoolError, ReadPoolHandle},
     server::Config,
     storage::{
         self, Engine, Snapshot, SnapshotStore,
@@ -738,7 +738,8 @@ impl<E: Engine> Endpoint<E> {
         );
         async move {
             spawn_fut_result?.await?;
-            rx.map_err(|_| Error::MaxPendingTasksExceeded).await?
+            rx.map_err(|_| Error::MaxPendingTasksExceeded(false))
+                .await?
         }
     }
 
@@ -1196,14 +1197,9 @@ impl<E: Engine> Endpoint<E> {
         // Transparent to caller: embed admission delay into the stream itself.
         // On first poll, drives spawn_fut (sleep if delayed, then submit to
         // yatp). On error yields one error item. Then chains with rx items.
-        let stream = futures::stream::once(Box::pin(async move {
-            spawn_fut
-                .await
-                .err()
-                .map(|_| Err(Error::MaxPendingTasksExceeded))
-        }))
-        .filter_map(futures::future::ready)
-        .chain(rx);
+        let stream = futures::stream::once(Box::pin(async move { spawn_fut.await.err().map(Err) }))
+            .filter_map(futures::future::ready)
+            .chain(rx);
         Ok(stream)
     }
 
@@ -1258,7 +1254,7 @@ impl<E: Engine> Endpoint<E> {
         Ok(self
             .read_pool
             .spawn(fut, priority, task_id, metadata, resource_limiter)
-            .map(|r| r.map_err(|_| Error::MaxPendingTasksExceeded))
+            .map(|r| r.map_err(read_pool_spawn_error))
             .boxed())
     }
 
@@ -1288,6 +1284,16 @@ impl<E: Engine> Endpoint<E> {
             deadline,
             task_id,
         }
+    }
+}
+
+/// Only the two load-shedding paths carry `noisy`; the rest are nobody's fault.
+pub(super) fn read_pool_spawn_error(err: ReadPoolError) -> Error {
+    match err {
+        ReadPoolError::UnifiedReadPoolFull { noisy } | ReadPoolError::Rejected { noisy } => {
+            Error::MaxPendingTasksExceeded(noisy)
+        }
+        _ => Error::MaxPendingTasksExceeded(false),
     }
 }
 
@@ -1347,10 +1353,10 @@ macro_rules! make_error_response_common {
                 err.set_message($e.to_string());
                 $resp.set_region_error(err);
             }
-            Error::MaxPendingTasksExceeded => {
+            Error::MaxPendingTasksExceeded(noisy) => {
                 $tag = "max_pending_tasks_exceeded";
                 let mut server_is_busy_err = errorpb::ServerIsBusy::default();
-                server_is_busy_err.set_reason($e.to_string());
+                server_is_busy_err.set_reason(busy_reason(&$e.to_string(), noisy));
                 let mut errorpb = errorpb::Error::default();
                 errorpb.set_message($e.to_string());
                 errorpb.set_server_is_busy(server_is_busy_err);
