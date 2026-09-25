@@ -23,7 +23,7 @@ use futures::{
 use kvproto::{coprocessor as coppb, errorpb, kvrpcpb, kvrpcpb::CommandPri, metapb};
 use online_config::ConfigManager;
 use protobuf::{CodedInputStream, Message};
-use resource_control::{busy_reason, ResourceGroupManager, ResourceLimiter, TaskMetadata};
+use resource_control::{ResourceGroupManager, ResourceLimiter, TaskMetadata, busy_reason};
 use resource_metering::{
     FutureExt, ResourceTagFactory, StreamExt, record_logical_read_bytes, record_network_in_bytes,
     record_network_out_bytes,

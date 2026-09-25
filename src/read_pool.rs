@@ -1242,7 +1242,7 @@ mod tests {
     use futures_executor::block_on;
     use kvproto::kvrpcpb::ResourceControlContext;
     use raftstore::store::{ReadStats, WriteStats};
-    use resource_control::{config::Config as ResourceControlConfig, ResourceGroupManager};
+    use resource_control::{ResourceGroupManager, config::Config as ResourceControlConfig};
 
     use super::*;
     use crate::storage::TestEngineBuilder;
