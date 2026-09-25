@@ -478,14 +478,18 @@ impl ReadPoolHandle {
         }
     }
 
-    /// Whether `resource_group` is itself being shed; the same predicate the
-    /// spawn path puts on `ReadPoolError`.
-    pub fn is_noisy_request(&self, resource_group: &str) -> bool {
+    /// Whether this request's group is itself being shed; the same predicate
+    /// the spawn path puts on `ReadPoolError`. Background is classified from
+    /// `request_source`, as the write scheduler does.
+    pub fn is_noisy_request(&self, resource_group: &str, request_source: &str) -> bool {
         match self {
             ReadPoolHandle::Yatp {
                 resource_manager: Some(rm),
                 ..
-            } => rm.is_noisy_request(resource_group, false),
+            } => {
+                let is_background = rm.is_background_request(resource_group, request_source);
+                rm.is_noisy_request(resource_group, is_background)
+            }
             _ => false,
         }
     }
@@ -505,8 +509,9 @@ impl ReadPoolHandle {
         };
         let group = std::str::from_utf8(resource_group).unwrap_or_default();
         // Only a held group skips: it is already being shed. Everyone else, and
-        // everyone while reporting is off, keeps the replica-redirect hint.
-        if self.is_noisy_request(group) {
+        // everyone while reporting is off, keeps the replica-redirect hint. No
+        // request source reaches here; this is a foreground hint, judged so.
+        if self.is_noisy_request(group, "") {
             UNIFIED_READ_POOL_BUSY_THRESHOLD_SKIPPED.inc();
             return Ok(());
         }
@@ -2541,6 +2546,52 @@ mod tests {
             .expect_err("with nobody named the advisory applies again");
 
         running_tasks[0].sub(500);
+    }
+
+    #[test]
+    fn test_is_noisy_request_classifies_background_by_request_source() {
+        let resource_manager = Arc::new(ResourceGroupManager::new(ResourceControlConfig {
+            enable_read_admission_control: true,
+            ..Default::default()
+        }));
+        let mut group = new_resource_group_ru("rc".into(), 5000, 1);
+        group
+            .mut_background_settings()
+            .set_job_types(vec!["br".to_owned()].into());
+        resource_manager.add_resource_group(group);
+        let _ctl = resource_manager.derive_controller("read".into(), true);
+        let engine = TestEngineBuilder::new().build().unwrap();
+        let pool = build_yatp_read_pool_with_name(
+            &UnifiedReadPoolConfig {
+                min_thread_count: 1,
+                max_thread_count: 1,
+                ..Default::default()
+            },
+            DummyReporter,
+            engine,
+            None,
+            Some(resource_manager.clone()),
+            CleanupMethod::InPlace,
+            "test-noisy-bg-source".to_owned(),
+            false,
+        );
+        let handle = pool.handle();
+        assert!(resource_manager.is_background_request("rc", "br"));
+
+        // Throttle the group's foreground limiter.
+        resource_manager.record_ru_consumption("rc", 10_000_000);
+        resource_manager.set_bg_cpu_at_floor(true);
+        resource_manager.online_adjust_resource_quota(90.0);
+        resource_manager.online_adjust_resource_quota(90.0);
+        assert!(handle.is_noisy_request("rc", ""), "foreground is held");
+
+        // Same group, background source: judged by the background limiter,
+        // as the spawn path and the write scheduler judge it.
+        assert_eq!(
+            handle.is_noisy_request("rc", "br"),
+            resource_manager.is_noisy_request("rc", true),
+        );
+        assert!(!handle.is_noisy_request("rc", "br"), "background is not");
     }
 
     #[test]
